@@ -1,0 +1,25 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# Clangd / IDE caches (keep .vscode project settings tracked)
+.clangd/
+**/compile_commands.json
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.venv/
+venv/
+.env
+*.npz
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
