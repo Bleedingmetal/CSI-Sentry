@@ -17,6 +17,9 @@ venv/
 .env
 *.npz
 
+# Local notes / docs (not part of the firmware tree)
+*.md
+
 # OS / editor junk
 .DS_Store
 Thumbs.db

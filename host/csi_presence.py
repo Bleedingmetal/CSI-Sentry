@@ -1,348 +1,89 @@
 from __future__ import annotations
 
 import argparse
-import collections
 import queue
-import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
-
-import numpy as np
+from typing import Dict, Iterable, List, Optional
 
 try:
-    import serial
+    import serial  # noqa: F401
     from serial.tools import list_ports
 except ImportError as exc:
     raise SystemExit("Install deps: pip install -r host/requirements.txt") from exc
 
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+import matplotlib
 
+from analytics import OCCUPY_THRESH, PresenceAnalytics, drain_queue
+from ingest import (
+    CsiPacket,
+    FakeCsiThread,
+    SerialReaderThread,
+    TcpReaderThread,
+    load_room_layout,
+)
+from ui import (
+    UI,
+    draw_events,
+    draw_room,
+    draw_spec,
+    make_figure,
+    node_color,
+    setup_timeseries,
+)
 
-CSI_PREFIX = "CSI"
-CSI_HEADER_FIELDS = 14
 DEFAULT_BAUD = 921600
 DEFAULT_CALIBRATE_S = 30.0
-PLOT_HISTORY = 400
-MOVING_AVG_WIN = 8
 QUEUE_MAX = 2000
 
 
-@dataclass(frozen=True)
-class CsiPacket:
-    node_id: int
-    seq: int
-    rssi: int
-    noise: int
-    channel: int
-    mac: str
-    len_: int
-    fw_inv: bool
-    samples: np.ndarray
-    t_recv: float = field(default_factory=time.time)
-
-    def amplitude(self) -> np.ndarray:
-        raw = self.samples.astype(np.float32)
-        if self.fw_inv and raw.size >= 4:
-            raw = raw[4:]
-        if raw.size < 2:
-            return np.empty(0, dtype=np.float32)
-        if raw.size % 2:
-            raw = raw[:-1]
-        iq = raw.reshape(-1, 2)
-        return np.sqrt(iq[:, 0] ** 2 + iq[:, 1] ** 2)
-
-
-def parse_csi_line(line: str) -> Optional[CsiPacket]:
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None
-    if not line.startswith(CSI_PREFIX + ","):
-        return None
-
-    parts = line.split(",")
-    if len(parts) < CSI_HEADER_FIELDS:
-        return None
-
-    try:
-        node_id = int(parts[1])
-        seq = int(parts[2])
-        rssi = int(parts[3])
-        noise = int(parts[4])
-        channel = int(parts[5])
-        mac = parts[11].strip().lower()
-        declared_len = int(parts[12])
-        fw_inv = bool(int(parts[13]))
-    except (ValueError, IndexError):
-        return None
-
-    sample_tokens = parts[CSI_HEADER_FIELDS:]
-    if declared_len <= 0:
-        return None
-
-    if len(sample_tokens) < max(1, declared_len // 2):
-        return None
-
-    samples_list: List[int] = []
-    for tok in sample_tokens[:declared_len]:
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            samples_list.append(int(tok))
-        except ValueError:
-            break
-
-    if len(samples_list) < 8:
-        return None
-
-    return CsiPacket(
-        node_id=node_id,
-        seq=seq,
-        rssi=rssi,
-        noise=noise,
-        channel=channel,
-        mac=mac,
-        len_=len(samples_list),
-        fw_inv=fw_inv,
-        samples=np.asarray(samples_list, dtype=np.int8),
-    )
-
-
-class SerialReaderThread(threading.Thread):
-    def __init__(
-        self,
-        port: str,
-        baud: int,
-        out_q: "queue.Queue[CsiPacket]",
-        stop_event: threading.Event,
-    ) -> None:
-        super().__init__(name=f"serial:{port}", daemon=True)
-        self.port = port
-        self.baud = baud
-        self.out_q = out_q
-        self.stop_event = stop_event
-        self.stats = {"lines": 0, "parsed": 0, "bad": 0, "q_drop": 0}
-
-    def run(self) -> None:
-        try:
-            with serial.Serial(self.port, self.baud, timeout=0.05) as ser:
-                ser.reset_input_buffer()
-                buf = ""
-                while not self.stop_event.is_set():
-                    chunk = ser.read(4096)
-                    if not chunk:
-                        continue
-                    try:
-                        buf += chunk.decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-
-                    while "\n" in buf:
-                        raw_line, buf = buf.split("\n", 1)
-                        self.stats["lines"] += 1
-                        pkt = parse_csi_line(raw_line)
-                        if pkt is None:
-                            self.stats["bad"] += 1
-                            continue
-                        self.stats["parsed"] += 1
-                        try:
-                            self.out_q.put_nowait(pkt)
-                        except queue.Full:
-                            try:
-                                self.out_q.get_nowait()
-                            except queue.Empty:
-                                pass
-                            try:
-                                self.out_q.put_nowait(pkt)
-                            except queue.Full:
-                                self.stats["q_drop"] += 1
-        except serial.SerialException as exc:
-            print(f"[serial] {self.port}: {exc}", file=sys.stderr)
-
-
-class NodeBaseline:
-    def __init__(self) -> None:
-        self.count = 0
-        self.mean: Optional[np.ndarray] = None
-        self.target_bins: Optional[int] = None
-
-    def update(self, amp: np.ndarray) -> None:
-        if amp.size == 0:
-            return
-        if self.mean is None:
-            self.mean = amp.astype(np.float64).copy()
-            self.target_bins = amp.size
-            self.count = 1
-            return
-        vec = self._align(amp)
-        self.count += 1
-        self.mean += (vec - self.mean) / self.count
-
-    def _align(self, amp: np.ndarray) -> np.ndarray:
-        assert self.target_bins is not None
-        n = self.target_bins
-        if amp.size == n:
-            return amp.astype(np.float64)
-        if amp.size > n:
-            return amp[:n].astype(np.float64)
-        out = np.zeros(n, dtype=np.float64)
-        out[: amp.size] = amp
-        return out
-
-    def disturbance(self, amp: np.ndarray) -> float:
-        if self.mean is None or amp.size == 0:
-            return 0.0
-        vec = self._align(amp)
-        err = vec - self.mean
-        return float(np.mean(err * err))
-
-    def ready(self) -> bool:
-        return self.mean is not None and self.count >= 10
-
-
-class PresenceAnalytics:
-    def __init__(self, calibrate_s: float, moving_avg: int = MOVING_AVG_WIN) -> None:
-        self.calibrate_s = calibrate_s
-        self.calibrating = calibrate_s > 0
-        self.calib_deadline = time.time() + calibrate_s if self.calibrating else 0.0
-        self.baselines: Dict[int, NodeBaseline] = {}
-        self.history: Dict[int, Deque[Tuple[float, float]]] = {}
-        self.moving_avg = max(1, moving_avg)
-        self._score_bufs: Dict[int, Deque[float]] = {}
-        self.last_seq: Dict[int, int] = {}
-        self.seq_gaps: Dict[int, int] = {}
-        self.lock = threading.Lock()
-
-    def _node_baseline(self, node_id: int) -> NodeBaseline:
-        if node_id not in self.baselines:
-            self.baselines[node_id] = NodeBaseline()
-            self.history[node_id] = collections.deque(maxlen=PLOT_HISTORY)
-            self._score_bufs[node_id] = collections.deque(maxlen=self.moving_avg)
-            self.seq_gaps[node_id] = 0
-        return self.baselines[node_id]
-
-    def process(self, pkt: CsiPacket) -> None:
-        amp = pkt.amplitude()
-        with self.lock:
-            prev = self.last_seq.get(pkt.node_id)
-            if prev is not None and pkt.seq > prev + 1:
-                self.seq_gaps[pkt.node_id] = self.seq_gaps.get(pkt.node_id, 0) + (
-                    pkt.seq - prev - 1
-                )
-            self.last_seq[pkt.node_id] = pkt.seq
-
-            bl = self._node_baseline(pkt.node_id)
-
-            if self.calibrating:
-                if time.time() < self.calib_deadline:
-                    bl.update(amp)
-                    self.history[pkt.node_id].append((pkt.t_recv, 0.0))
-                    return
-                self.calibrating = False
-                print(
-                    "[calib] done — baselines: "
-                    + ", ".join(
-                        f"node {nid} n={b.count} bins={b.target_bins}"
-                        for nid, b in self.baselines.items()
-                    )
-                )
-
-            score = bl.disturbance(amp) if bl.ready() else 0.0
-            buf = self._score_bufs[pkt.node_id]
-            buf.append(score)
-            smooth = float(sum(buf) / len(buf))
-            self.history[pkt.node_id].append((pkt.t_recv, smooth))
-
-    def snapshot(self) -> Dict[int, List[Tuple[float, float]]]:
-        with self.lock:
-            return {nid: list(hist) for nid, hist in self.history.items()}
-
-    def status_line(self) -> str:
-        with self.lock:
-            if self.calibrating:
-                left = max(0.0, self.calib_deadline - time.time())
-                return f"CALIBRATING empty room… {left:4.1f}s left"
-            parts = []
-            for nid, bl in sorted(self.baselines.items()):
-                hist = self.history.get(nid)
-                score = hist[-1][1] if hist else 0.0
-                gaps = self.seq_gaps.get(nid, 0)
-                parts.append(f"N{nid}:{score:6.1f} gaps={gaps}")
-            return " | ".join(parts) if parts else "waiting for CSI…"
-
-    def save(self, path: Path) -> None:
-        with self.lock:
-            payload = {}
-            for nid, bl in self.baselines.items():
-                if bl.mean is None:
-                    continue
-                payload[f"node_{nid}_mean"] = bl.mean
-                payload[f"node_{nid}_count"] = np.asarray([bl.count])
-            if not payload:
-                raise RuntimeError("No baseline to save")
-            np.savez(path, **payload)
-            print(f"[calib] saved → {path}")
-
-    def load(self, path: Path) -> None:
-        data = np.load(path)
-        with self.lock:
-            self.calibrating = False
-            for key in data.files:
-                if not key.endswith("_mean"):
-                    continue
-                nid = int(key.split("_")[1])
-                bl = self._node_baseline(nid)
-                bl.mean = data[key].astype(np.float64)
-                bl.target_bins = int(bl.mean.size)
-                count_key = f"node_{nid}_count"
-                bl.count = int(data[count_key][0]) if count_key in data.files else 100
-            print(f"[calib] loaded ← {path} nodes={list(self.baselines)}")
-
-
-def drain_queue(q: "queue.Queue[CsiPacket]", analytics: PresenceAnalytics) -> int:
-    n = 0
-    while True:
-        try:
-            pkt = q.get_nowait()
-        except queue.Empty:
-            break
-        analytics.process(pkt)
-        n += 1
-    return n
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="CSI-Sentry real-time presence monitor")
+    p = argparse.ArgumentParser(
+        description=(
+            "CSI-Sentry real-time presence monitor. "
+            "With the SoftAP aggregator, pass one COM port — remotes arrive over Wi-Fi."
+        )
+    )
     p.add_argument(
         "--ports",
         type=str,
         default="",
-        help="Comma-separated serial ports (e.g. COM12,COM13). Empty = auto-list & prompt.",
-    )
-    p.add_argument("--baud", type=int, default=DEFAULT_BAUD)
-    p.add_argument(
-        "--calibrate",
-        type=float,
-        default=DEFAULT_CALIBRATE_S,
-        help="Empty-room calibration duration in seconds (0 = skip / use --baseline).",
+        help="COM port(s). Aggregator USB mode: one port, e.g. --ports COM5",
     )
     p.add_argument(
-        "--baseline",
+        "--tcp",
         type=str,
         default="",
-        help="Load a previously saved .npz baseline (skips calibration if present).",
+        help="Wi-Fi mode: aggregator IP:port after joining SoftAP, e.g. 192.168.4.1:5006",
     )
     p.add_argument(
-        "--save-baseline",
+        "--layout",
         type=str,
-        default="baseline.npz",
-        help="Where to write the baseline after calibration.",
+        default=str(Path(__file__).with_name("room_layout.json")),
+        help="Room size + ESP positions in meters (JSON). Calib does NOT discover these.",
     )
-    p.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
+    p.add_argument("--baud", type=int, default=DEFAULT_BAUD,
+                   help="UART baud (default 921600; try 115200 if garbled)")
+    p.add_argument("--calibrate", type=float, default=DEFAULT_CALIBRATE_S,
+                   help="Empty-room baseline seconds (press r live to redo)")
+    p.add_argument("--baseline", type=str, default="")
+    p.add_argument("--save-baseline", type=str, default="baseline.npz")
+    p.add_argument(
+        "--demo",
+        action="store_true",
+        help="No hardware: synthesize CSI (default 3 nodes).",
+    )
+    p.add_argument(
+        "--demo-nodes",
+        type=str,
+        default="1,2,3",
+        help="Comma-separated node IDs for --demo (default 1,2,3).",
+    )
+    p.add_argument("--snapshot", type=str, default="")
+    p.add_argument("--snapshot-seconds", type=float, default=18.0)
+    p.add_argument("--thresh", type=float, default=OCCUPY_THRESH)
+    p.add_argument("--list-ports", action="store_true")
     return p
 
 
@@ -362,45 +103,76 @@ def resolve_ports(ports_arg: str) -> List[str]:
 
 
 def run_monitor(args: argparse.Namespace) -> None:
-    ports = resolve_ports(args.ports)
-    print(f"[init] ports={ports} baud={args.baud}")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
 
     pkt_q: queue.Queue[CsiPacket] = queue.Queue(maxsize=QUEUE_MAX)
     stop_event = threading.Event()
-    readers = [
-        SerialReaderThread(port, args.baud, pkt_q, stop_event) for port in ports
-    ]
-    for r in readers:
-        r.start()
+    readers: List[threading.Thread] = []
+    fake: Optional[FakeCsiThread] = None
+    node_ids = [1, 2, 3]
 
-    analytics = PresenceAnalytics(calibrate_s=args.calibrate)
-    if args.baseline:
+    if args.demo:
+        node_ids = [int(x) for x in args.demo_nodes.split(",") if x.strip()]
+        if args.calibrate == DEFAULT_CALIBRATE_S:
+            args.calibrate = 5.0
+        fake = FakeCsiThread(pkt_q, stop_event, node_ids, calib_s=args.calibrate)
+        fake.start()
+        readers.append(fake)
+        print(f"[init] DEMO mode nodes={node_ids} calib={args.calibrate}s")
+    elif args.tcp.strip():
+        hostport = args.tcp.strip()
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            tcp_port = int(port_s)
+        else:
+            host, tcp_port = hostport, 5006
+        print(f"[init] TCP mode {host}:{tcp_port} (join SoftAP CSI-Sentry first)")
+        r = TcpReaderThread(host, tcp_port, pkt_q, stop_event)
+        r.start()
+        readers.append(r)
+    else:
+        ports = resolve_ports(args.ports)
+        print(f"[init] ports={ports} baud={args.baud}")
+        for port in ports:
+            r = SerialReaderThread(port, args.baud, pkt_q, stop_event)
+            r.start()
+            readers.append(r)
+
+    analytics = PresenceAnalytics(calibrate_s=args.calibrate, occupy_thresh=args.thresh)
+    if args.baseline and not args.demo:
         path = Path(args.baseline)
         if path.is_file():
             analytics.load(path)
         else:
-            print(f"[warn] baseline file not found: {path} — calibrating instead")
+            print(f"[warn] baseline file not found: {path} - calibrating instead")
 
-    fig, ax = plt.subplots(figsize=(11, 5))
-    fig.canvas.manager.set_window_title("CSI-Sentry Presence")
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("disturbance (MSE vs baseline)")
-    ax.set_title("CSI presence / motion score by node")
-    ax.grid(True, alpha=0.3)
+    fig, ax_ts, ax_room, ax_spec, ax_evt = make_figure()
+    fig.canvas.manager.set_window_title("CSI-Sentry")
+    status = setup_timeseries(ax_ts, args.thresh)
+
     lines: Dict[int, object] = {}
     t0 = time.time()
-    status = ax.text(
-        0.01,
-        0.98,
-        "",
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        fontsize=9,
-        family="monospace",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
-    )
     saved_baseline = False
+    draw_room(ax_room, {}, None, analytics.room_state(), node_ids, live=[])
+    draw_spec(ax_spec, None)
+    draw_events(ax_evt, ["r  recalibrate", "s  save baseline"])
+
+    def on_key(event) -> None:
+        nonlocal saved_baseline
+        key = (event.key or "").lower()
+        if key == "r":
+            analytics.start_recalibrate(args.calibrate if args.calibrate > 0 else 20.0)
+            saved_baseline = False
+        elif key == "s" and not args.demo and args.save_baseline:
+            try:
+                analytics.save(Path(args.save_baseline))
+                saved_baseline = True
+            except RuntimeError as exc:
+                print(f"[calib] save failed: {exc}", flush=True)
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    print("[ui] keys: r = recalibrate empty room, s = save baseline", flush=True)
 
     def on_timer(_frame: int):
         nonlocal saved_baseline
@@ -411,6 +183,7 @@ def run_monitor(args: argparse.Namespace) -> None:
             and not saved_baseline
             and args.calibrate > 0
             and args.save_baseline
+            and not args.demo
         ):
             try:
                 analytics.save(Path(args.save_baseline))
@@ -425,16 +198,25 @@ def run_monitor(args: argparse.Namespace) -> None:
             xs = [t - t0 for t, _ in hist]
             ys = [s for _, s in hist]
             if nid not in lines:
-                (ln,) = ax.plot(xs, ys, lw=1.5, label=f"node {nid}")
+                (ln,) = ax_ts.plot(
+                    xs, ys, lw=1.35, color=node_color(nid),
+                    solid_capstyle="round", label=f"N{nid}",
+                )
                 lines[nid] = ln
-                ax.legend(loc="upper right")
+                ax_ts.legend(loc="upper right", fontsize=8, handlelength=1.6)
             else:
                 lines[nid].set_data(xs, ys)
 
         if snap:
-            ax.relim()
-            ax.autoscale_view()
+            ax_ts.relim()
+            ax_ts.autoscale_view()
 
+        st = analytics.room_state()
+        person = fake.person_xy if fake is not None else None
+        live = analytics.live_nodes()
+        draw_room(ax_room, analytics.latest_scores(), person, st, node_ids, live=live)
+        draw_spec(ax_spec, analytics.spectrogram(), analytics.spectrogram_node())
+        draw_events(ax_evt, analytics.event_lines())
         status.set_text(analytics.status_line())
         return list(lines.values()) + [status]
 
@@ -448,15 +230,89 @@ def run_monitor(args: argparse.Namespace) -> None:
             r.join(timeout=1.0)
         print("[exit] reader stats:")
         for r in readers:
-            print(f"  {r.port}: {r.stats}")
+            stats = getattr(r, "stats", {})
+            port = getattr(r, "port", r.name)
+            print(f"  {port}: {stats}")
         _ = anim
+
+
+def run_snapshot(args: argparse.Namespace) -> None:
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pkt_q: queue.Queue[CsiPacket] = queue.Queue(maxsize=QUEUE_MAX)
+    stop_event = threading.Event()
+    if args.calibrate == DEFAULT_CALIBRATE_S:
+        args.calibrate = 5.0
+    node_ids = [int(x) for x in args.demo_nodes.split(",") if x.strip()]
+    fake = FakeCsiThread(pkt_q, stop_event, node_ids, calib_s=args.calibrate, hz=50.0)
+    fake.start()
+    analytics = PresenceAnalytics(calibrate_s=args.calibrate, occupy_thresh=args.thresh)
+
+    t_end = time.time() + args.snapshot_seconds
+    while time.time() < t_end:
+        drain_queue(pkt_q, analytics)
+        time.sleep(0.02)
+
+    stop_event.set()
+    fake.join(timeout=1.0)
+    drain_queue(pkt_q, analytics)
+
+    fig, ax_ts, ax_room, ax_spec, ax_evt = make_figure()
+    status = setup_timeseries(ax_ts, args.thresh, title="Presence score")
+
+    t0 = None
+    for nid, hist in sorted(analytics.snapshot().items()):
+        if not hist:
+            continue
+        if t0 is None:
+            t0 = hist[0][0]
+        xs = [t - t0 for t, _ in hist]
+        ys = [s for _, s in hist]
+        ax_ts.plot(
+            xs, ys, lw=1.35, color=node_color(nid),
+            solid_capstyle="round", label=f"N{nid}",
+        )
+    ax_ts.legend(loc="upper right", fontsize=8, handlelength=1.6)
+    if args.calibrate > 0 and t0 is not None:
+        ax_ts.axvline(args.calibrate, color=UI["faint"], ls=(0, (1, 2)), lw=0.9)
+
+    st = analytics.room_state()
+    draw_room(
+        ax_room,
+        analytics.latest_scores(),
+        fake.person_xy,
+        st,
+        node_ids,
+        live=analytics.live_nodes(),
+    )
+    draw_spec(ax_spec, analytics.spectrogram(), analytics.spectrogram_node())
+    draw_events(ax_evt, analytics.event_lines())
+    status.set_text(analytics.status_line())
+    out = Path(args.snapshot)
+    fig.savefig(out, dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"[demo] snapshot saved -> {out.resolve()}")
+    print(f"[demo] status: {analytics.status_line()}")
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    layout_path = Path(args.layout) if args.layout else None
+    if layout_path and layout_path.is_file():
+        load_room_layout(layout_path)
+    else:
+        load_room_layout(None)
+        if args.layout:
+            print(f"[layout] file missing ({args.layout}) — using default triangle", flush=True)
     if args.list_ports:
         for info in list_ports.comports():
             print(f"{info.device}\t{info.description}")
+        return
+    if args.snapshot:
+        if not args.demo:
+            args.demo = True
+        run_snapshot(args)
         return
     run_monitor(args)
 

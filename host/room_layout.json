@@ -1,0 +1,12 @@
+{
+  "name": "my room",
+  "width_m": 4.0,
+  "height_m": 3.5,
+  "origin": "one corner = (0,0); +x along width wall, +y along depth wall",
+  "nodes": [
+    {"id": 1, "x_m": 0.5, "y_m": 0.5, "label": "aggregator — edit me"},
+    {"id": 2, "x_m": 3.5, "y_m": 0.5, "label": "remote — edit me"},
+    {"id": 3, "x_m": 2.0, "y_m": 3.0, "label": "remote — edit me"}
+  ],
+  "_read_me": "See host/LAYOUT_INSTRUCTIONS.md — measure room width_m/height_m and each ESP x_m/y_m from the same corner."
+}
